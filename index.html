@@ -508,27 +508,36 @@ function detectNoteheads(binary,staves){
   if(!staves.length)return[];
   const avgSp=staves.reduce((a,s)=>a+s.spacing,0)/staves.length;
   const W=binary.cols;
-  const minW=avgSp*0.45,maxW=avgSp*1.5,minH=avgSp*0.40,maxH=avgSp*1.05;
-  const minArea=avgSp*avgSp*0.20,maxArea=avgSp*avgSp*1.80;
+
+  // Generous filter ranges — better to pass too many and filter later
+  // than to miss real noteheads
+  const minW=avgSp*0.25, maxW=avgSp*2.2;
+  const minH=avgSp*0.20, maxH=avgSp*1.4;
+  const minArea=avgSp*avgSp*0.06, maxArea=avgSp*avgSp*3.0;
+
+  log(`avgSpacing:${avgSp.toFixed(1)}px  notehead target W:${minW.toFixed(1)}-${maxW.toFixed(1)} H:${minH.toFixed(1)}-${maxH.toFixed(1)} Area:${minArea.toFixed(0)}-${maxArea.toFixed(0)}`,'info');
+
   const notes=[],contours=new cv.MatVector(),hierarchy=new cv.Mat();
+  const rej={area:0,width:0,height:0,aspect:0,staffLine:0,notNearStaff:0};
   try{
     const tmp=binary.clone();
     cv.findContours(tmp,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
-    log(`Contours: ${contours.size()}`,'info');
+    log(`Total contours: ${contours.size()}`,'info');
     for(let i=0;i<contours.size();i++){
       const cnt=contours.get(i);const area=cv.contourArea(cnt);const rect=cv.boundingRect(cnt);cnt.delete();
       const w=rect.width,h=rect.height,cx=rect.x+w/2,cy=rect.y+h/2,aspect=w/Math.max(h,1);
-      if(area<minArea||area>maxArea)continue;
-      if(w<minW||w>maxW)continue;
-      if(h<minH||h>maxH)continue;
-      if(aspect<0.5||aspect>2.0)continue;
-      if(w>W*0.06)continue;
-      const near=staves.some(s=>cy>=s.top-s.spacing*1.5&&cy<=s.bottom+s.spacing*1.5);
-      if(!near)continue;
+      if(area<minArea||area>maxArea){rej.area++;continue;}
+      if(w<minW||w>maxW){rej.width++;continue;}
+      if(h<minH||h>maxH){rej.height++;continue;}
+      if(aspect<0.3||aspect>3.0){rej.aspect++;continue;}
+      if(w>W*0.10){rej.staffLine++;continue;}  // reject very wide barlines/staff lines
+      const near=staves.some(s=>cy>=s.top-s.spacing*2.0&&cy<=s.bottom+s.spacing*2.0);
+      if(!near){rej.notNearStaff++;continue;}
       const filled=_isFilledNotehead(binary,rect);
       const stem=_detectStem(binary,rect,avgSp);
       notes.push({x:cx,y:cy,w,h,area,filled,hasStem:stem.has,stemUp:stem.up,raw_rect:rect});
     }
+    log(`Passed: ${notes.length}  Rejected — area:${rej.area} w:${rej.width} h:${rej.height} aspect:${rej.aspect} staffLine:${rej.staffLine} notNearStaff:${rej.notNearStaff}`,'info');
     tmp.delete();
   }finally{contours.delete();hierarchy.delete();}
   notes.sort((a,b)=>a.x-b.x);
