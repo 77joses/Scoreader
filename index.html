@@ -349,6 +349,7 @@ async function processImage(imgEl,filename){
     setStage('thresh','active');await sleep(20);
     const binary=new cv.Mat();
     cv.adaptiveThreshold(gray,binary,255,cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY_INV,25,8);
+    window.binary_global=binary; // stored for fallback detection strategy
     setStage('thresh','done');log('Adaptive threshold applied','ok');
     setStage('staff','active');await sleep(20);
     const staves=detectStaves(binary,fullW,fullH);
@@ -481,34 +482,54 @@ function detectKeySig(binary,staves){
 
 function detectTimeSig(){return{num:4,den:4,str:'4/4'};}
 
-// NOTEHEAD DETECTION REWRITE
-// Research findings applied:
-// 1. Runs on staff-removed image (no staff line interference)
-// 2. Morphological closing (MORPH_CLOSE) fills hollow noteheads -> solid blobs
-//    This is the technique used by oemer and Audiveris OMR systems
-// 3. Circularity filter: 4*PI*area/perimeter^2
-//    Noteheads: 0.5-0.95, Stems/barlines: <0.15, Beams: 0.1-0.3
-//    Much more reliable than aspect ratio alone
-// 4. Generous size tolerance (wide range catches all score types)
 function detectNoteheads(cleaned,staves){
   if(!staves.length)return[];
   const avgSp=staves.reduce((a,s)=>a+s.spacing,0)/staves.length;
-  const W=cleaned.cols;
-  log('avgSpacing='+avgSp.toFixed(1)+'px  running morphological close + circularity filter','info');
-  const kW=Math.max(3,Math.round(avgSp*0.55)),kH=Math.max(3,Math.round(avgSp*0.50));
+  const W=cleaned.cols,H=cleaned.rows;
+  log('avgSpacing='+avgSp.toFixed(1)+'px  W='+W+' H='+H,'info');
+
+  // Count total dark pixels in cleaned image to verify it has content
+  let darkPixels=0;
+  for(let i=0;i<cleaned.data.length;i++){if(cleaned.data[i]>128)darkPixels++;}
+  log('Dark pixels in cleaned image: '+darkPixels,'info');
+  if(darkPixels<100){log('WARN: cleaned image nearly empty - staff removal too aggressive','warn');}
+
+  // STRATEGY 1: Try on cleaned image with morphological close
+  const notes1=_detectPass(cleaned,staves,avgSp,W,'cleaned+morph');
+  if(notes1.length>=5){log('Strategy 1 (cleaned+morph) succeeded: '+notes1.length+' notes','ok');return notes1;}
+  log('Strategy 1 found only '+notes1.length+' - trying original binary','warn');
+
+  // STRATEGY 2: Fall back to ORIGINAL binary image (with staff lines)
+  // Staff lines hurt but at least we get something
+  const notes2=_detectPass(binary_global,staves,avgSp,W,'original binary');
+  if(notes2.length>=5){log('Strategy 2 (original binary) found: '+notes2.length+' notes','ok');return notes2;}
+  log('Strategy 2 found only '+notes2.length+' - trying no circularity filter','warn');
+
+  // STRATEGY 3: No circularity filter at all, just size + near staff
+  const notes3=_detectPassNoCirc(cleaned,staves,avgSp,W);
+  log('Strategy 3 (no circularity): '+notes3.length+' notes','info');
+  return notes3.length>notes2.length?notes3:notes2;
+}
+
+function _detectPass(img,staves,avgSp,W,label){
+  const kW=Math.max(3,Math.round(avgSp*0.5)),kH=Math.max(3,Math.round(avgSp*0.45));
   const kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kW,kH));
   const closed=new cv.Mat();
-  cv.morphologyEx(cleaned,closed,cv.MORPH_CLOSE,kernel);
+  cv.morphologyEx(img,closed,cv.MORPH_CLOSE,kernel);
   kernel.delete();
-  const minW=avgSp*0.20,maxW=avgSp*2.5;
-  const minH=avgSp*0.18,maxH=avgSp*1.7;
-  const minArea=avgSp*avgSp*0.04,maxArea=avgSp*avgSp*4.5;
+
+  const minW=avgSp*0.15,maxW=avgSp*3.0;
+  const minH=avgSp*0.12,maxH=avgSp*2.0;
+  const minArea=avgSp*avgSp*0.02,maxArea=avgSp*avgSp*6.0;
+
   const notes=[],contours=new cv.MatVector(),hierarchy=new cv.Mat();
   const rej={area:0,size:0,circ:0,barline:0,far:0};
+  // Sample first 5 contours for debug
+  const samples=[];
   try{
     const tmp=closed.clone();
     cv.findContours(tmp,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
-    log('Contours after morph close: '+contours.size(),'info');
+    log('['+label+'] contours='+contours.size()+' kernel='+kW+'x'+kH,'info');
     for(let i=0;i<contours.size();i++){
       const cnt=contours.get(i);
       const area=cv.contourArea(cnt);
@@ -516,20 +537,50 @@ function detectNoteheads(cleaned,staves){
       const perim=cv.arcLength(cnt,true);
       cnt.delete();
       const w=rect.width,h=rect.height,cx=rect.x+w/2,cy=rect.y+h/2;
+      const circ=perim>0?(4*Math.PI*area)/(perim*perim):0;
+      if(samples.length<5)samples.push('a='+Math.round(area)+' w='+Math.round(w)+' h='+Math.round(h)+' c='+circ.toFixed(2));
       if(area<minArea||area>maxArea){rej.area++;continue;}
       if(w<minW||w>maxW||h<minH||h>maxH){rej.size++;continue;}
-      const circ=perim>0?(4*Math.PI*area)/(perim*perim):0;
-      if(circ<0.38){rej.circ++;continue;}
-      if(w>W*0.09){rej.barline++;continue;}
-      const near=staves.some(s=>cy>=s.top-s.spacing*2.2&&cy<=s.bottom+s.spacing*2.2);
+      if(circ<0.30){rej.circ++;continue;}
+      if(w>W*0.12){rej.barline++;continue;}
+      const near=staves.some(s=>cy>=s.top-s.spacing*2.5&&cy<=s.bottom+s.spacing*2.5);
       if(!near){rej.far++;continue;}
-      const filled=_isFilledNotehead(cleaned,rect);
-      const stem=_detectStem(cleaned,rect,avgSp);
+      const filled=_isFilledNotehead(img,rect);
+      const stem=_detectStem(img,rect,avgSp);
       notes.push({x:cx,y:cy,w,h,area,circularity:circ,filled,hasStem:stem.has,stemUp:stem.up});
     }
-    log('Passed: '+notes.length+'  Rejected - area:'+rej.area+' size:'+rej.size+' circ:'+rej.circ+' barline:'+rej.barline+' far:'+rej.far,'info');
+    if(samples.length)log('Sample contours: '+samples.join(' | '),'info');
+    log('['+label+'] pass='+notes.length+' rej area='+rej.area+' size='+rej.size+' circ='+rej.circ+' barline='+rej.barline+' far='+rej.far,'info');
     tmp.delete();
   }finally{contours.delete();hierarchy.delete();closed.delete();}
+  notes.sort((a,b)=>a.x-b.x);
+  return notes;
+}
+
+function _detectPassNoCirc(img,staves,avgSp,W){
+  const minW=avgSp*0.20,maxW=avgSp*2.0;
+  const minH=avgSp*0.18,maxH=avgSp*1.5;
+  const minArea=avgSp*avgSp*0.04,maxArea=avgSp*avgSp*3.5;
+  const notes=[],contours=new cv.MatVector(),hierarchy=new cv.Mat();
+  const rej={area:0,size:0,barline:0,far:0};
+  try{
+    const tmp=img.clone();
+    cv.findContours(tmp,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+    for(let i=0;i<contours.size();i++){
+      const cnt=contours.get(i);const area=cv.contourArea(cnt);const rect=cv.boundingRect(cnt);cnt.delete();
+      const w=rect.width,h=rect.height,cx=rect.x+w/2,cy=rect.y+h/2;
+      if(area<minArea||area>maxArea){rej.area++;continue;}
+      if(w<minW||w>maxW||h<minH||h>maxH){rej.size++;continue;}
+      if(w>W*0.12){rej.barline++;continue;}
+      const near=staves.some(s=>cy>=s.top-s.spacing*2.5&&cy<=s.bottom+s.spacing*2.5);
+      if(!near){rej.far++;continue;}
+      const filled=_isFilledNotehead(img,rect);
+      const stem=_detectStem(img,rect,avgSp);
+      notes.push({x:cx,y:cy,w,h,area,circularity:0,filled,hasStem:stem.has,stemUp:stem.up});
+    }
+    log('[noCirc] pass='+notes.length+' rej area='+rej.area+' size='+rej.size+' barline='+rej.barline+' far='+rej.far,'info');
+    tmp.delete();
+  }finally{contours.delete();hierarchy.delete();}
   notes.sort((a,b)=>a.x-b.x);
   return notes;
 }
